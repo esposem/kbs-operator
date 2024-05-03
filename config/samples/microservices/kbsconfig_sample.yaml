@@ -14,8 +14,7 @@ spec:
   kbsAsConfigMapName: as-config-grpc
   kbsRvpsConfigMapName: rvps-config-grpc
   kbsAuthSecretName: kbs-auth-public-key
-  kbsServiceType: ClusterIP
-  #kbsServiceType: NodePort
+  kbsServiceType: NodePort
   #kbsServiceType: LoadBalancer
   #kbsServiceType: ExternalName
   kbsDeploymentType: MicroservicesDeployment

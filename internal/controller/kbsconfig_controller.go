@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -40,6 +41,117 @@ import (
 	confidentialcontainersorgv1alpha1 "github.com/confidential-containers/trustee-operator/api/v1alpha1"
 	"github.com/go-logr/logr"
 )
+
+// KbsConfig represents the KBS configuration structure
+type KbsConfig struct {
+	Admin AdminConfig `toml:"admin"`
+}
+
+// AdminConfig represents the admin section configuration
+type AdminConfig struct {
+	DisableAdminAPI bool `toml:"disable_admin_api"`
+}
+
+// Default values for KBS configuration
+const (
+	DefaultDisableAdminAPI = true
+)
+
+// NewKbsConfig creates a new KbsConfig with default values
+func NewKbsConfig() *KbsConfig {
+	return &KbsConfig{
+		Admin: AdminConfig{
+			DisableAdminAPI: DefaultDisableAdminAPI,
+		},
+	}
+}
+
+// ParseKbsConfigFromTOML parses TOML content and returns a KbsConfig with validation
+func ParseKbsConfigFromTOML(content string) (*KbsConfig, error) {
+	// Start with default configuration
+	config := NewKbsConfig()
+
+	// Parse the TOML content to extract admin section
+	adminConfig, err := parseAdminSectionFromTOML(content)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse admin section: %w", err)
+	}
+
+	// Update the config with parsed values
+	if adminConfig != nil {
+		config.Admin = *adminConfig
+	}
+
+	return config, nil
+}
+
+// ValidateAdminAPI validates that the admin API is properly disabled
+func (c *KbsConfig) ValidateAdminAPI() error {
+	if !c.Admin.DisableAdminAPI {
+		return fmt.Errorf("admin API is not disabled (disable_admin_api = %t)", c.Admin.DisableAdminAPI)
+	}
+	return nil
+}
+
+// parseAdminSectionFromTOML extracts the admin section from TOML content
+func parseAdminSectionFromTOML(content string) (*AdminConfig, error) {
+	lines := strings.Split(content, "\n")
+	inAdminSection := false
+	var adminConfig *AdminConfig
+
+	for i, line := range lines {
+		trimmedLine := strings.TrimSpace(line)
+
+		// Skip empty lines and comments
+		if trimmedLine == "" || strings.HasPrefix(trimmedLine, "#") {
+			continue
+		}
+
+		// Check if we're entering the admin section
+		if trimmedLine == "[admin]" {
+			inAdminSection = true
+			adminConfig = &AdminConfig{}
+			continue
+		}
+
+		// Check if we're leaving the admin section (new section starts)
+		if inAdminSection && strings.HasPrefix(trimmedLine, "[") && trimmedLine != "[admin]" {
+			inAdminSection = false
+			break
+		}
+
+		// If we're in the admin section, parse the configuration
+		if inAdminSection {
+			if strings.HasPrefix(trimmedLine, "disable_admin_api") {
+				value, err := parseBooleanValue(trimmedLine)
+				if err != nil {
+					return nil, fmt.Errorf("invalid disable_admin_api value at line %d: %w", i+1, err)
+				}
+				adminConfig.DisableAdminAPI = value
+			}
+		}
+	}
+
+	return adminConfig, nil
+}
+
+// parseBooleanValue extracts boolean value from a TOML key=value line
+func parseBooleanValue(line string) (bool, error) {
+	parts := strings.SplitN(line, "=", 2)
+	if len(parts) != 2 {
+		return false, fmt.Errorf("invalid format: %s", line)
+	}
+
+	value := strings.TrimSpace(parts[1])
+	switch value {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid boolean value: %s", value)
+	}
+}
 
 // KbsConfigReconciler reconciles a KbsConfig object
 type KbsConfigReconciler struct {
@@ -116,6 +228,13 @@ func (r *KbsConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
+	}
+
+	// Validate the KBS configmap before proceeding with deployment
+	err = r.validateKbsConfigMap(ctx)
+	if err != nil {
+		r.log.Info("KBS configmap validation failed", "err", err)
+		return ctrl.Result{}, err
 	}
 
 	// Create or update the KBS deployment
@@ -843,4 +962,53 @@ func namespacePredicate(namespace string) predicate.Predicate {
 func isResourceInNamespace(obj metav1.Object, namespace string) bool {
 
 	return obj.GetNamespace() == namespace
+}
+
+// validateKbsConfigMap validates the kbs-config.toml content in the configmap
+// Returns an error if the admin section doesn't have disable_admin_api = true
+func (r *KbsConfigReconciler) validateKbsConfigMap(ctx context.Context) error {
+	if r.kbsConfig.Spec.KbsConfigMapName == "" {
+		return fmt.Errorf("KbsConfigMapName is not specified")
+	}
+
+	// Get the configmap
+	configMap := &corev1.ConfigMap{}
+	err := r.Client.Get(ctx, client.ObjectKey{
+		Namespace: r.namespace,
+		Name:      r.kbsConfig.Spec.KbsConfigMapName,
+	}, configMap)
+	if err != nil {
+		return fmt.Errorf("failed to get configmap %s: %w", r.kbsConfig.Spec.KbsConfigMapName, err)
+	}
+
+	// Get the kbs-config.toml content
+	configContent, exists := configMap.Data["kbs-config.toml"]
+	if !exists {
+		return fmt.Errorf("kbs-config.toml key not found in configmap %s", r.kbsConfig.Spec.KbsConfigMapName)
+	}
+
+	// Parse the TOML content to validate admin section
+	return r.validateAdminSection(configContent)
+}
+
+// validateAdminSection parses the TOML content and validates the admin section
+func (r *KbsConfigReconciler) validateAdminSection(configContent string) error {
+	// Parse the configuration using our structured approach
+	config, err := ParseKbsConfigFromTOML(configContent)
+	if err != nil {
+		return fmt.Errorf("failed to parse KBS configuration in configmap %s: %w",
+			r.kbsConfig.Spec.KbsConfigMapName, err)
+	}
+
+	// Validate that admin API is disabled
+	if err := config.ValidateAdminAPI(); err != nil {
+		return fmt.Errorf("admin API validation failed in configmap %s: %w",
+			r.kbsConfig.Spec.KbsConfigMapName, err)
+	}
+
+	r.log.Info("Admin API is properly disabled in configmap",
+		"configmap", r.kbsConfig.Spec.KbsConfigMapName,
+		"disable_admin_api", config.Admin.DisableAdminAPI)
+
+	return nil
 }

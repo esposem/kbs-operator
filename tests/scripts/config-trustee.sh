@@ -18,6 +18,7 @@ data:
 
     [admin]
     insecure_api = true
+    disable_admin_api = true
     auth_public_key = "/etc/auth-secret/publicKey"
 
     [attestation_token]
